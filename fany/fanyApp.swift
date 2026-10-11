@@ -19,20 +19,20 @@ enum FanSpeed: Int, CaseIterable {
     /// 菜单显示名称
     var menuTitle: String {
         switch self {
-        case .off: return "0档（关闭）"
-        case .low: return "一档（慢速）"
-        case .medium: return "二档（中速）"
-        case .high: return "三档（快速）"
+        case .off: return "0 档（关闭）"
+        case .low: return "1 档（慢速）"
+        case .medium: return "2 档（中速）"
+        case .high: return "3 档（快速）"
         }
     }
 
-    /// 帧切换间隔（秒），数值越小转速越快；按 24 帧/圈折算角速度
-    var frameInterval: TimeInterval {
+    /// 60Hz 固定时钟下每 tick 推进的帧数（24 帧/圈），数值越大转速越快
+    var framesPerTick: Double {
         switch self {
         case .off: return 0 // 0 档不转，仅占位
-        case .low: return 0.12
-        case .medium: return 0.06
-        case .high: return 0.02
+        case .low: return 1.2    // 约 3 圈/秒
+        case .medium: return 1.5 // 约 3.8 圈/秒
+        case .high: return 2.4   // 约 6 圈/秒
         }
     }
 }
@@ -66,13 +66,17 @@ struct fanyApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let state = AppState()
-    private var animationTimer: Timer?
+    private let displayTick: TimeInterval = 1.0 / 60   // 单一 60Hz 统一时钟，同时驱动旋转与摇头
+    private var displayTimer: Timer?
     private var frameIndex = 0
+    private var framePosition: Double = 0              // 累计帧位置（支持小数步进）
+    private var currentFramesPerTick: Double = 0       // 当前实际转速，平滑爬升/下降到档位目标值
+    private let rampStep: Double = 0.012               // 加减速斜率：每 tick 转速变化量（约 0.7 帧/tick每秒）
+    private var glidingToStop = false                  // 转速归零后的尾段回正滑行中
 
-    // 摇头摆动参数：图标整体以中心为轴左右摆动
-    private let oscillationAmplitude: CGFloat = 15 * .pi / 180  // 摆幅 ±15°
-    private let oscillationPeriod: TimeInterval = 1.5           // 一个完整往复周期
-    private var oscillationTimer: Timer?
+    // 摇头摆动参数：模拟绕垂直轴“转头”，水平方向透视压缩，扇叶自身不额外旋转
+    private let oscillationAmplitude: CGFloat = 40 * .pi / 180  // 最大偏航角 ±40°，对应宽度压缩到 cos(40°)≈0.77
+    private let oscillationPeriod: TimeInterval = 4.0           // 一个完整往复周期（放慢至 4 秒）
     private var oscillationPhase: TimeInterval = 0
 
     /// 脚本生成的帧序列（frame_0 ~ frame_N，数量随脚本自动适配）
@@ -145,89 +149,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectSpeed(_ sender: NSMenuItem) {
         guard let speed = FanSpeed(rawValue: sender.tag), speed != state.speed else { return }
         state.speed = speed
-        if speed == .off {
-            // 0 档：停止旋转，回到静止图标
-            animationTimer?.invalidate()
-            animationTimer = nil
-            frameIndex = 0
-            updateIcon()
-        } else {
-            restartAnimation() // 切换档位后立即生效
-        }
+        // 切到 0 档时时钟继续运行：实际转速从当前值平滑减速到 0，再滑行回正
+        syncTimer()
         sender.state = .on
     }
 
     @objc private func toggleOscillation(_ sender: NSMenuItem) {
         state.isOscillating.toggle()
         sender.state = state.isOscillating ? .on : .off
-        print("摇头开关：\(state.isOscillating ? "开" : "关")")
-        if state.isOscillating {
-            startOscillation()
-        } else {
-            stopOscillation()
-        }
+        oscillationPhase = 0 // 切换时从回正位置开始
+        syncTimer()
     }
 
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
     }
 
-    // MARK: 动画
+    // MARK: 动画（单一时钟 + 平滑加减速）
 
-    private func restartAnimation() {
-        animationTimer?.invalidate()
-        let interval = state.speed.frameInterval
-        animationTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self, self.frames.count > 1 else { return }
-            self.frameIndex = (self.frameIndex + 1) % self.frames.count
-            self.updateIcon()
+    /// 统一时钟在“有运动”时运行：档位>0、减速中或尾段回正滑行中，全部结束后自动停表
+    private func syncTimer() {
+        let shouldRun = state.speed != .off || currentFramesPerTick > 0 || glidingToStop
+        if shouldRun, displayTimer == nil {
+            let timer = Timer(timeInterval: displayTick, repeats: true) { [weak self] _ in
+                self?.tick()
+            }
+            timer.tolerance = 0 // 不启用系统时钟合并，保证节奏均匀
+            RunLoop.main.add(timer, forMode: .common) // 菜单打开时动画不暂停
+            displayTimer = timer
+        } else if !shouldRun {
+            displayTimer?.invalidate()
+            displayTimer = nil
+            updateIcon()
         }
-        animationTimer?.tolerance = 0 // 不启用系统时钟合并，保证逐帧节奏均匀
-        RunLoop.main.add(animationTimer!, forMode: .common) // 菜单打开时动画不暂停
+    }
+
+    private func tick() {
+        guard frames.count > 1 else { return }
+        let count = Double(frames.count)
+        let target = state.speed.framesPerTick
+
+        // 实际转速线性爬升到目标档位（加速、减速都平滑）
+        if currentFramesPerTick < target {
+            currentFramesPerTick = min(target, currentFramesPerTick + rampStep)
+        } else if currentFramesPerTick > target {
+            currentFramesPerTick = max(target, currentFramesPerTick - rampStep)
+        }
+
+        if currentFramesPerTick > 0 {
+            framePosition += currentFramesPerTick
+            framePosition = framePosition.truncatingRemainder(dividingBy: count)
+            glidingToStop = false
+        } else if state.speed == .off {
+            // 转速已归零：缓动滑行到最近的整圈位置（扇叶回正），避免跳帧
+            if framePosition > 0.02 {
+                glidingToStop = true
+                let goal = framePosition > count / 2 ? count : 0
+                framePosition += (goal - framePosition) * 0.12
+                if abs(goal - framePosition) < 0.02 {
+                    framePosition = 0
+                    oscillationPhase = 0
+                }
+            } else {
+                // 完全停止：复位并停表
+                framePosition = 0
+                oscillationPhase = 0
+                glidingToStop = false
+                displayTimer?.invalidate()
+                displayTimer = nil
+            }
+        }
+        frameIndex = Int(framePosition) % frames.count
+
+        if state.isOscillating && state.speed != .off {
+            oscillationPhase += displayTick
+        }
+        updateIcon()
     }
 
     private func updateIcon() {
         guard !frames.isEmpty else { return }
         let base = frames[frameIndex % frames.count]
-        if state.isOscillating {
-            // 当前摆动角度：正弦驱动，相位由 oscillationTimer 推进
-            let angle = oscillationAmplitude * sin(2 * .pi * oscillationPhase / oscillationPeriod)
-            statusItem.button?.image = rotatedCopy(of: base, angleRadians: angle)
+        if state.isOscillating && state.speed != .off {
+            // 当前偏航角：正弦驱动左右“转头”，用水平压缩模拟绕垂直轴旋转
+            let yaw = oscillationAmplitude * sin(2 * .pi * oscillationPhase / oscillationPeriod)
+            statusItem.button?.image = swungCopy(of: base, yawRadians: yaw)
         } else {
             statusItem.button?.image = base
         }
     }
 
-    // MARK: 摇头动效
-
-    private func startOscillation() {
-        oscillationPhase = 0
-        oscillationTimer?.invalidate()
-        let dt = 1.0 / 30  // 30fps，摆动视觉平滑且开销极小
-        oscillationTimer = Timer.scheduledTimer(withTimeInterval: dt, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.oscillationPhase += dt
-            self.updateIcon()
-        }
-        oscillationTimer?.tolerance = 0
-        RunLoop.main.add(oscillationTimer!, forMode: .common)
-    }
-
-    private func stopOscillation() {
-        oscillationTimer?.invalidate()
-        oscillationTimer = nil
-        updateIcon() // 图标回正
-    }
-
-    /// 将模板图旋转一个小角度后输出新图（正方形画布，内容居中）
-    private func rotatedCopy(of image: NSImage, angleRadians angle: CGFloat) -> NSImage {
-        let side = max(image.size.width, image.size.height)
-        let result = NSImage(size: NSSize(width: side, height: side))
+    /// 将模板图按偏航角做水平透视压缩后输出新图：
+    /// 摇头表现为扇面左右“转头”（宽度随角度收缩/恢复），而非扇叶旋转
+    private func swungCopy(of image: NSImage, yawRadians yaw: CGFloat) -> NSImage {
+        let size = image.size
+        let result = NSImage(size: size)
         result.lockFocus()
         let transform = NSAffineTransform()
-        transform.translateX(by: side / 2, yBy: side / 2)
-        transform.rotate(byRadians: angle)
-        transform.translateX(by: -image.size.width / 2, yBy: -image.size.height / 2)
+        // 转向哪侧，重心略向哪侧偏移，增强“转头”方向感（压缩后两侧各留 ~25% 空间，不会裁切）
+        let shift = size.width * 0.15 * sin(yaw)
+        transform.translateX(by: size.width / 2 + shift, yBy: size.height / 2)
+        transform.scaleX(by: cos(yaw), yBy: 1)   // 绕垂直轴旋转的 2D 投影：水平压缩
+        transform.translateX(by: -size.width / 2, yBy: -size.height / 2)
         transform.concat()
         image.draw(at: .zero,
                    from: NSRect(origin: .zero, size: image.size),
